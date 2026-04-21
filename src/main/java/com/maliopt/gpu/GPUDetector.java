@@ -31,6 +31,11 @@ public class GPUDetector {
         return cachedRenderer;
     }
 
+    /** Alias de getRenderer() — usado por ShaderCache e ShaderCapabilities */
+    public static String getGPUModel() {
+        return getRenderer();
+    }
+
     public static String getVendor() {
         if (cachedVendor == null) cachedVendor = safeGet(GL11.GL_VENDOR);
         return cachedVendor;
@@ -41,22 +46,10 @@ public class GPUDetector {
         return cachedVersion;
     }
 
-    /**
-     * FASE 3 — Detecção de extensões com prioridade MobileGlues.
-     *
-     * Ordem de prioridade:
-     * 1. MobileGlues activo + backend_string_getter_access
-     *    → extensões GLES reais do driver Mali (102 extensões)
-     * 2. glGetStringi loop (GL4ES / qualquer outro renderer)
-     *    → extensões desktop emuladas (87 extensões — problema conhecido)
-     * 3. Fallback glGetString
-     *    → último recurso
-     */
     public static Set<String> getAllExtensions() {
         if (cachedExtensions != null) return cachedExtensions;
 
         // PRIORIDADE 1 — MobileGlues backend access
-        // Retorna as 102 extensões GLES reais do Mali-G52 MC2
         if (MobileGluesDetector.isActive() && MobileGluesDetector.hasBackendAccess()) {
             Set<String> backendExts = MobileGluesDetector.getBackendExtensions();
             if (!backendExts.isEmpty()) {
@@ -66,7 +59,7 @@ public class GPUDetector {
             }
         }
 
-        // PRIORIDADE 2 — glGetStringi loop (GL4ES / sem MobileGlues)
+        // PRIORIDADE 2 — glGetStringi loop
         Set<String> exts = new HashSet<>();
         try {
             int count = GL11.glGetInteger(GL30.GL_NUM_EXTENSIONS);
