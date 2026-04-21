@@ -5,6 +5,7 @@ import com.maliopt.gpu.ExtensionActivator;
 import com.maliopt.gpu.GPUDetector;
 import com.maliopt.gpu.MobileGluesDetector;
 import com.maliopt.mixin.GameOptionsAccessor;
+import com.maliopt.pipeline.FBFetchBloomPass;
 import com.maliopt.pipeline.MaliPipelineOptimizer;
 import com.maliopt.pipeline.PLSLightingPass;
 import com.maliopt.pipeline.ShaderCacheManager;
@@ -51,7 +52,13 @@ public class MaliOptMod implements ClientModInitializer {
                 ExtensionActivator.activateAll();
                 MaliPipelineOptimizer.init();
                 ShaderCacheManager.init();
+
+                // Fase 3a — Lighting pass
                 PLSLightingPass.init();
+
+                // Fase 3b — Bloom via FBFetch
+                FBFetchBloomPass.init();
+
                 forceDistances(client);
 
             } else {
@@ -59,18 +66,30 @@ public class MaliOptMod implements ClientModInitializer {
             }
         });
 
-        // Fase 3a: PLS lighting aplicado após render do mundo
+        // ── Post-process pipeline ─────────────────────────────────
+        // Ordem importante: primeiro lighting, depois bloom.
+        // Ambos correm após o mundo estar completamente renderizado.
         WorldRenderEvents.LAST.register(context -> {
             MinecraftClient mc = MinecraftClient.getInstance();
+
+            // 1. PLSLightingPass — warmth, AO, gamma
             if (PLSLightingPass.isReady()) {
                 PLSLightingPass.render(mc);
+            }
+
+            // 2. FBFetchBloomPass — bloom com ou sem FBFetch
+            //    Se FBFetch disponível: lê da tile memory (ZERO DRAM)
+            //    Se não: texture sample (1 pass, ainda mais rápido que Iris)
+            if (FBFetchBloomPass.isReady()) {
+                FBFetchBloomPass.render(mc);
             }
         });
 
         // Cleanup ao fechar
-        ClientLifecycleEvents.CLIENT_STOPPING.register(client ->
-            PLSLightingPass.cleanup()
-        );
+        ClientLifecycleEvents.CLIENT_STOPPING.register(client -> {
+            PLSLightingPass.cleanup();
+            FBFetchBloomPass.cleanup();
+        });
     }
 
     private static void forceDistances(MinecraftClient client) {
