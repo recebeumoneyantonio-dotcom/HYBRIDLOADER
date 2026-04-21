@@ -3,7 +3,8 @@
   "package": "com.maliopt.mixin",
   "compatibilityLevel": "JAVA_21",
   "client": [
-    "MixinGameRenderer"
+    "MixinGameRenderer",
+    "GameOptionsAccessor"
   ],
   "injectors": {
     "defaultRequire": 1
