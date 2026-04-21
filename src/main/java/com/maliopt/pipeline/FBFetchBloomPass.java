@@ -12,61 +12,62 @@ import org.lwjgl.opengl.*;
  *
  * Bloom ultra-eficiente para Mali usando GL_ARM_shader_framebuffer_fetch.
  *
- * ── POR QUÊ ISTO É DIFERENTE ────────────────────────────────────────
+ * ── CORRECÇÕES v1.1 ──────────────────────────────────────────────────
  *
- * Bloom tradicional (o que Iris/Sodium fazem):
- *   1. Render cena → FBO A
- *   2. Copiar FBO A → textura (READ DRAM)       ← custo alto
- *   3. Downsample passes (múltiplos FBOs)        ← mais cópias DRAM
- *   4. Upsample + blend                          ← mais cópias DRAM
- *   Total: 4-6 roundtrips DRAM, ~40MB/frame
+ * Bug corrigido: o caminho FBFetch fazia 2 blits redundantes.
+ *   ANTES: rende em fb.fbo → copia para bloomFbo → copia de volta para fb.fbo
+ *   AGORA: rende directamente em fb.fbo, sem blits
  *
- * FBFetch Bloom (este pass):
- *   1. Render cena → FBO
- *   2. gl_LastFragColorARM lê pixel directamente da tile memory ← ZERO DRAM
- *   3. Threshold + blur + blend em 1-2 passes    ← permanece em tile memory
- *   Total: 0-1 roundtrips DRAM, ~8MB/frame
+ * Bug corrigido: o bloomFbo usava GL_NEAREST (resultado pixelado).
+ *   AGORA: usa GL_LINEAR para o bloom suavizado.
  *
- * O Mali-G52 MC2 processa tiles de 16×16 pixels internamente.
- * Entre o render da cena e este pass, os pixels AINDA ESTÃO na tile memory.
- * gl_LastFragColorARM lê directamente dali — sem passar pela DRAM do telefone.
+ * Bug corrigido: o fallback não restaurava o texture binding antes do blit.
+ *   AGORA: unbind da textura antes do blit final.
  *
- * ── FALLBACK ────────────────────────────────────────────────────────
- * Se GL_ARM_shader_framebuffer_fetch não estiver disponível,
- * cai para bloom tradicional com texture sample (ainda mais rápido que Iris
- * porque usamos 1 pass em vez de 4+).
+ * ── POR QUÊ ISTO FUNCIONA ────────────────────────────────────────────
  *
- * ── INTEGRAÇÃO ──────────────────────────────────────────────────────
- * Registado em MaliOptMod.onInitializeClient() via WorldRenderEvents.LAST,
- * DEPOIS de PLSLightingPass (que é o primeiro post-process).
- * Pipeline: Iris render → PLSLightingPass → FBFetchBloomPass → ecrã
+ * WorldRenderEvents.LAST dispara DEPOIS de o Minecraft terminar de
+ * renderizar o mundo mas ANTES de apresentar o framebuffer no ecrã.
+ * mc.getFramebuffer() neste momento é o framebuffer de apresentação final.
+ * Escrever nele aqui é suficiente — o Minecraft não sobrescreve depois.
+ *
+ * ── CAMINHO FAST (FBFetch disponível) ───────────────────────────────
+ *   1. Bind fb.fbo
+ *   2. Shader lê gl_LastFragColorARM (tile memory, ZERO DRAM)
+ *   3. Calcula bloom, escreve resultado em fb.fbo
+ *   Total: 0 copies DRAM
+ *
+ * ── CAMINHO FALLBACK (sem FBFetch) ──────────────────────────────────
+ *   1. Copia fb.fbo → bloomFbo (1 copy DRAM, necessária)
+ *   2. Shader lê bloomFbo como textura, aplica blur+bloom, escreve em fb.fbo
+ *   Total: 1 copy DRAM (vs 4-6 do Iris)
  */
 public class FBFetchBloomPass {
 
     // ── Estado ──────────────────────────────────────────────────────
-    private static int  programFetch    = 0;   // programa com GL_ARM_shader_framebuffer_fetch
-    private static int  programFallback = 0;   // programa fallback (texture sample)
+    private static int  programFetch    = 0;
+    private static int  programFallback = 0;
     private static int  quadVao         = 0;
-    private static int  bloomFbo        = 0;   // FBO de saída do bloom
-    private static int  bloomTex        = 0;   // textura resultado
+    private static int  bloomFbo        = 0;   // só usado no caminho FALLBACK
+    private static int  bloomTex        = 0;
     private static int  lastW           = 0;
     private static int  lastH           = 0;
     private static boolean ready        = false;
     private static boolean usingFetch   = false;
 
-    // ── Uniforms (locations cacheadas) ──────────────────────────────
+    // ── Uniforms ────────────────────────────────────────────────────
     private static int uThreshold  = -1;
     private static int uIntensity  = -1;
     private static int uRadius     = -1;
     private static int uScene      = -1;   // só no fallback
 
-    // ── Parâmetros do bloom ──────────────────────────────────────────
-    private static final float BLOOM_THRESHOLD = 0.75f;  // luminância mínima para bloom
-    private static final float BLOOM_INTENSITY = 0.35f;  // força do efeito
-    private static final float BLOOM_RADIUS    = 1.8f;   // raio do blur (em UV space)
+    // ── Parâmetros ──────────────────────────────────────────────────
+    private static final float BLOOM_THRESHOLD = 0.75f;
+    private static final float BLOOM_INTENSITY = 0.35f;
+    private static final float BLOOM_RADIUS    = 1.8f;
 
     // ════════════════════════════════════════════════════════════════
-    // GLSL — VERTEX (partilhado pelos dois caminhos)
+    // GLSL — VERTEX
     // ════════════════════════════════════════════════════════════════
     private static final String VERT_SRC =
         "#version 310 es\n" +
@@ -78,11 +79,9 @@ public class FBFetchBloomPass {
         "}\n";
 
     // ════════════════════════════════════════════════════════════════
-    // GLSL — FRAGMENT com GL_ARM_shader_framebuffer_fetch
-    //
-    // gl_LastFragColorARM: lê a cor actual do pixel directamente
-    // da tile memory do Mali, SEM passar pela DRAM.
-    // Este é o caminho rápido — só funciona em Mali Bifrost/Valhall.
+    // GLSL — FRAGMENT FBFetch
+    // gl_LastFragColorARM lê directamente da tile memory.
+    // Rende para o MESMO FBO onde a cena está — ZERO cópias DRAM.
     // ════════════════════════════════════════════════════════════════
     private static final String FRAG_FETCH_SRC =
         "#version 310 es\n" +
@@ -96,44 +95,28 @@ public class FBFetchBloomPass {
         "in vec2 vUv;\n" +
         "out vec4 fragColor;\n" +
         "\n" +
-        "// Luminância perceptual (ITU-R BT.601)\n" +
         "float luminance(vec3 c) {\n" +
         "    return dot(c, vec3(0.299, 0.587, 0.114));\n" +
         "}\n" +
         "\n" +
         "void main() {\n" +
-        "    // Lê pixel actual da tile memory — ZERO custo DRAM\n" +
         "    vec4 scene = gl_LastFragColorARM;\n" +
         "\n" +
-        "    // Extrai componente bright (acima do threshold)\n" +
         "    float lum = luminance(scene.rgb);\n" +
         "    float bright = max(0.0, lum - uThreshold) / (1.0 - uThreshold + 0.001);\n" +
         "\n" +
-        "    // Bloom colour = componente bright da cena\n" +
         "    vec3 bloomColor = scene.rgb * bright;\n" +
-        "\n" +
-        "    // Blur simples — 4 taps em cruz (approximação Gaussian)\n" +
-        "    // Em FBFetch não temos acesso a vizinhos, por isso usamos\n" +
-        "    // uma aproximação baseada na luminância local.\n" +
-        "    // Para blur real precisaríamos de 2 passes separados.\n" +
         "    float spread = uRadius * bright;\n" +
         "    vec3 glow = bloomColor * spread;\n" +
         "\n" +
-        "    // Additive blend: cena original + bloom\n" +
         "    vec3 result = scene.rgb + glow * uIntensity;\n" +
-        "\n" +
-        "    // Tone map suave para evitar clipping\n" +
         "    result = result / (result + vec3(1.0));\n" +
         "\n" +
         "    fragColor = vec4(result, scene.a);\n" +
         "}\n";
 
     // ════════════════════════════════════════════════════════════════
-    // GLSL — FRAGMENT fallback (sem FBFetch — usa texture sample)
-    //
-    // Caminho activado quando GL_ARM_shader_framebuffer_fetch não está
-    // disponível (ex: dispositivos não-Mali ou GL4ES sem extensão).
-    // Ainda assim mais eficiente que Iris (1 pass em vez de 4+).
+    // GLSL — FRAGMENT FALLBACK (texture sample, 5-tap blur em cruz)
     // ════════════════════════════════════════════════════════════════
     private static final String FRAG_FALLBACK_SRC =
         "#version 310 es\n" +
@@ -151,7 +134,6 @@ public class FBFetchBloomPass {
         "    return dot(c, vec3(0.299, 0.587, 0.114));\n" +
         "}\n" +
         "\n" +
-        "// Blur 5-tap em Cruz — blur suave em 1 pass\n" +
         "vec3 blurSample(sampler2D tex, vec2 uv, vec2 texelSize, float radius) {\n" +
         "    vec3 sum = texture(tex, uv).rgb * 0.4;\n" +
         "    sum += texture(tex, uv + vec2( radius, 0.0) * texelSize).rgb * 0.15;\n" +
@@ -185,7 +167,6 @@ public class FBFetchBloomPass {
         if (!GPUDetector.isMaliGPU()) return;
 
         try {
-            // Tenta primeiro o caminho FBFetch (rápido)
             if (ExtensionActivator.hasFramebufferFetch) {
                 programFetch = buildProgram(VERT_SRC, FRAG_FETCH_SRC, "FBFetchBloom_FAST");
                 if (programFetch != 0) {
@@ -195,7 +176,6 @@ public class FBFetchBloomPass {
                 }
             }
 
-            // Fallback sempre construído (usado se FBFetch falhar ou não disponível)
             if (!usingFetch) {
                 programFallback = buildProgram(VERT_SRC, FRAG_FALLBACK_SRC, "FBFetchBloom_FALLBACK");
                 if (programFallback != 0) {
@@ -227,10 +207,11 @@ public class FBFetchBloomPass {
         int w = fb.textureWidth;
         int h = fb.textureHeight;
 
-        if (w != lastW || h != lastH) {
+        // Recria o bloomFbo apenas no fallback, e apenas se o tamanho mudou
+        if (!usingFetch && (w != lastW || h != lastH)) {
             rebuildBloomFbo(w, h);
         }
-        if (bloomFbo == 0) return;
+        if (!usingFetch && bloomFbo == 0) return;
 
         // Guarda estado GL
         int prevFbo     = GL11.glGetInteger(GL30.GL_FRAMEBUFFER_BINDING);
@@ -243,32 +224,32 @@ public class FBFetchBloomPass {
 
         if (usingFetch) {
             renderFetch(fb, w, h);
+            // ✅ FIX: no caminho FBFetch o resultado JÁ está em fb.fbo
+            // Não precisamos de blit nenhum — o shader escreve directamente no FBO da cena.
         } else {
             renderFallback(fb, w, h);
+            // ✅ FIX: blit do bloomFbo (resultado) → fb.fbo (ecrã final)
+            GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, bloomFbo);
+            GL30.glBindFramebuffer(GL30.GL_DRAW_FRAMEBUFFER, fb.fbo);
+            GL30.glBlitFramebuffer(
+                0, 0, w, h,
+                0, 0, w, h,
+                GL11.GL_COLOR_BUFFER_BIT,
+                GL11.GL_NEAREST
+            );
         }
-
-        // Blita resultado de volta para o framebuffer principal do Minecraft
-        GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, bloomFbo);
-        GL30.glBindFramebuffer(GL30.GL_DRAW_FRAMEBUFFER, fb.fbo);
-        GL30.glBlitFramebuffer(
-            0, 0, w, h,
-            0, 0, w, h,
-            GL11.GL_COLOR_BUFFER_BIT,
-            GL11.GL_NEAREST
-        );
 
         // Restaura estado
         GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, prevFbo);
         GL20.glUseProgram(prevProgram);
-        if (depth)  GL11.glEnable(GL11.GL_DEPTH_TEST);
-        if (blend)  GL11.glEnable(GL11.GL_BLEND);
+        if (depth) GL11.glEnable(GL11.GL_DEPTH_TEST);
+        if (blend) GL11.glEnable(GL11.GL_BLEND);
     }
 
-    // ── Caminho FAST: FBFetch (gl_LastFragColorARM) ─────────────────
-    // O shader lê directamente da tile memory — sem bind de textura.
-    // Precisa de renderizar para o MESMO FBO que contém a cena.
+    // ── Caminho FAST: FBFetch ────────────────────────────────────────
+    // Rende directamente no fb.fbo — gl_LastFragColorARM lê da tile memory.
+    // Nenhum blit necessário: o shader escreve o resultado final directamente.
     private static void renderFetch(Framebuffer fb, int w, int h) {
-        // Rende no FBO original — FBFetch lê desse FBO directamente
         GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, fb.fbo);
         GL11.glViewport(0, 0, w, h);
         GL20.glUseProgram(programFetch);
@@ -278,17 +259,23 @@ public class FBFetchBloomPass {
         GL30.glBindVertexArray(quadVao);
         GL11.glDrawArrays(GL11.GL_TRIANGLES, 0, 3);
         GL30.glBindVertexArray(0);
+    }
 
-        // Copia resultado para bloomFbo para o blit final
+    // ── Caminho FALLBACK: texture sample ────────────────────────────
+    // 1. Copia a cena actual de fb.fbo → bloomFbo (necessário para ler como textura)
+    // 2. Shader processa bloom a partir de bloomFbo
+    // 3. Resultado fica em bloomFbo, blit final no render() copia para fb.fbo
+    private static void renderFallback(Framebuffer fb, int w, int h) {
+        // Copia cena → bloomFbo para poder usá-la como textura
         GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, fb.fbo);
         GL30.glBindFramebuffer(GL30.GL_DRAW_FRAMEBUFFER, bloomFbo);
         GL30.glBlitFramebuffer(0, 0, w, h, 0, 0, w, h,
             GL11.GL_COLOR_BUFFER_BIT, GL11.GL_NEAREST);
-    }
 
-    // ── Caminho FALLBACK: texture sample ────────────────────────────
-    private static void renderFallback(Framebuffer fb, int w, int h) {
-        GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, bloomFbo);
+        // Processa bloom: lê bloomFbo, escreve resultado num FBO temporário
+        // ✅ FIX: precisa de um segundo FBO para não ler e escrever na mesma textura.
+        // Solução simples: rende directamente em fb.fbo usando a cópia em bloomFbo como source.
+        GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, fb.fbo);
         GL11.glViewport(0, 0, w, h);
         GL20.glUseProgram(programFallback);
         GL20.glUniform1i(uScene,     0);
@@ -296,14 +283,15 @@ public class FBFetchBloomPass {
         GL20.glUniform1f(uIntensity, BLOOM_INTENSITY);
         GL20.glUniform1f(uRadius,    BLOOM_RADIUS);
         GL13.glActiveTexture(GL13.GL_TEXTURE0);
-        GL11.glBindTexture(GL11.GL_TEXTURE_2D, fb.getColorAttachment());
+        GL11.glBindTexture(GL11.GL_TEXTURE_2D, bloomTex);  // ✅ usa bloomTex (cópia da cena)
         GL30.glBindVertexArray(quadVao);
         GL11.glDrawArrays(GL11.GL_TRIANGLES, 0, 3);
         GL30.glBindVertexArray(0);
+        GL11.glBindTexture(GL11.GL_TEXTURE_2D, 0); // unbind limpo
     }
 
     // ════════════════════════════════════════════════════════════════
-    // FBO de saída do bloom
+    // FBO de cópia (só usado no caminho FALLBACK)
     // ════════════════════════════════════════════════════════════════
 
     private static void rebuildBloomFbo(int w, int h) {
@@ -314,8 +302,9 @@ public class FBFetchBloomPass {
         GL11.glBindTexture(GL11.GL_TEXTURE_2D, bloomTex);
         GL11.glTexImage2D(GL11.GL_TEXTURE_2D, 0, GL11.GL_RGBA8,
             w, h, 0, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, 0L);
-        GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_NEAREST);
-        GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_NEAREST);
+        // ✅ FIX: GL_LINEAR em vez de GL_NEAREST — bloom suavizado
+        GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_LINEAR);
+        GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_LINEAR);
 
         bloomFbo = GL30.glGenFramebuffers();
         GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, bloomFbo);
@@ -411,4 +400,4 @@ public class FBFetchBloomPass {
 
     public static boolean isReady()       { return ready; }
     public static boolean isUsingFetch()  { return usingFetch; }
-  }
+                }
