@@ -7,13 +7,13 @@ import org.lwjgl.opengl.*;
 
 public class PLSLightingPass {
 
-    private static int  program   = 0;
-    private static int  quadVao   = 0;
-    private static int  outputFbo = 0;
-    private static int  outputTex = 0;
-    private static int  lastW     = 0;
-    private static int  lastH     = 0;
-    private static boolean ready  = false;
+    private static int     program   = 0;
+    private static int     quadVao   = 0;
+    private static int     outputFbo = 0;
+    private static int     outputTex = 0;
+    private static int     lastW     = 0;
+    private static int     lastH     = 0;
+    private static boolean ready     = false;
 
     // ── Vertex: fullscreen triangle sem VBO ──────────────────────────
     private static final String VERT =
@@ -25,52 +25,47 @@ public class PLSLightingPass {
         "    gl_Position = vec4(uv * 2.0 - 1.0, 0.0, 1.0);\n" +
         "}\n";
 
-    // ── Fragment: PLS multi-efeito num único pass ─────────────────────
-    // Tudo em tile memory — sem roundtrip para DRAM entre efeitos
+    // ── Fragment: PLS — escreve APENAS no tile memory ─────────────────
+    // Regra GL_EXT_shader_pixel_local_storage:
+    // não é possível escrever em fragColor E em PLS no mesmo shader.
+    // O resultado fica no tile memory; o blit posterior envia para DRAM.
     private static final String FRAG =
         "#version 310 es\n" +
         "#extension GL_EXT_shader_pixel_local_storage : require\n" +
         "precision mediump float;\n" +
         "\n" +
-        "// PLS — dados ficam no tile memory do Mali\n" +
+        "// PLS — tile memory para lighting data (lido em passes seguintes)\n" +
         "__pixel_localEXT PLSData {\n" +
-        "    layout(rgba8)          lowp  vec4 baseColor;\n" +
+        "    layout(rgba8)          lowp    vec4 baseColor;\n" +
         "    layout(r11f_g11f_b10f) mediump vec3 lightAccum;\n" +
         "} pls;\n" +
         "\n" +
         "uniform sampler2D uScene;\n" +
-        "uniform float uWarmth;   // calor nas zonas iluminadas\n" +
-        "uniform float uAO;       // intensidade do AO\n" +
+        "uniform float uWarmth;\n" +
+        "uniform float uAO;\n" +
         "uniform float uGamma;\n" +
         "\n" +
-        "in  vec2 vUv;\n" +
-        "out vec4 fragColor;\n" +
+        "in vec2 vUv;\n" +
         "\n" +
         "void main() {\n" +
         "    vec4  scene = texture(uScene, vUv);\n" +
         "    float lum   = dot(scene.rgb, vec3(0.299, 0.587, 0.114));\n" +
         "\n" +
-        "    // 1. Cor base no PLS\n" +
-        "    pls.baseColor = scene;\n" +
-        "\n" +
-        "    // 2. Warmth nas zonas iluminadas (tochas, lava, portais)\n" +
+        "    // Warmth nas zonas iluminadas (tochas, lava, portais)\n" +
         "    vec3 warm = scene.rgb * vec3(\n" +
         "        1.0 + uWarmth * lum,\n" +
         "        1.0 + uWarmth * 0.45 * lum,\n" +
         "        1.0 - uWarmth * 0.25 * lum\n" +
         "    );\n" +
         "\n" +
-        "    // 3. AO suave nas zonas escuras\n" +
-        "    float ao = mix(1.0 - uAO, 1.0, lum);\n" +
-        "    vec3  lit = warm * ao;\n" +
+        "    // AO suave nas zonas escuras\n" +
+        "    float ao     = mix(1.0 - uAO, 1.0, lum);\n" +
+        "    vec3  result = pow(clamp(warm * ao, 0.0, 1.0), vec3(1.0 / uGamma));\n" +
         "\n" +
-        "    // 4. Acumula no PLS — sem DRAM\n" +
-        "    pls.lightAccum = lit;\n" +
-        "\n" +
-        "    // 5. Gamma correction leve + output\n" +
-        "    vec3 result = pow(clamp(pls.lightAccum, 0.0, 1.0),\n" +
-        "                      vec3(1.0 / uGamma));\n" +
-        "    fragColor = vec4(result, scene.a);\n" +
+        "    // Escreve APENAS no PLS — sem fragColor\n" +
+        "    // Tile flush envia para o color attachment automaticamente\n" +
+        "    pls.baseColor  = vec4(result, scene.a);\n" +
+        "    pls.lightAccum = result;\n" +
         "}\n";
 
     // ─────────────────────────────────────────────────────────────────
@@ -96,7 +91,6 @@ public class PLSLightingPass {
                 return;
             }
 
-            // Uniforms default
             GL20.glUseProgram(program);
             GL20.glUniform1i(GL20.glGetUniformLocation(program, "uScene"),  0);
             GL20.glUniform1f(GL20.glGetUniformLocation(program, "uWarmth"), 0.18f);
@@ -104,7 +98,6 @@ public class PLSLightingPass {
             GL20.glUniform1f(GL20.glGetUniformLocation(program, "uGamma"),  1.08f);
             GL20.glUseProgram(0);
 
-            // VAO vazio — usa gl_VertexID no vertex shader
             quadVao = GL30.glGenVertexArrays();
 
             ready = true;
@@ -122,22 +115,21 @@ public class PLSLightingPass {
         int w = fb.textureWidth;
         int h = fb.textureHeight;
 
-        // Recria FBO de output se resolução mudou
         if (w != lastW || h != lastH) {
             rebuildOutputFbo(w, h);
         }
         if (outputFbo == 0) return;
 
         // Guarda estado GL
-        int prevFbo     = GL11.glGetInteger(GL30.GL_FRAMEBUFFER_BINDING);
-        int prevProgram = GL11.glGetInteger(GL20.GL_CURRENT_PROGRAM);
-        boolean depth   = GL11.glIsEnabled(GL11.GL_DEPTH_TEST);
-        boolean blend   = GL11.glIsEnabled(GL11.GL_BLEND);
+        int     prevFbo     = GL11.glGetInteger(GL30.GL_FRAMEBUFFER_BINDING);
+        int     prevProgram = GL11.glGetInteger(GL20.GL_CURRENT_PROGRAM);
+        boolean depth       = GL11.glIsEnabled(GL11.GL_DEPTH_TEST);
+        boolean blend       = GL11.glIsEnabled(GL11.GL_BLEND);
 
         GL11.glDisable(GL11.GL_DEPTH_TEST);
         GL11.glDisable(GL11.GL_BLEND);
 
-        // Render PLS pass → outputFbo
+        // PLS pass → outputFbo
         GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, outputFbo);
         GL11.glViewport(0, 0, w, h);
         GL20.glUseProgram(program);
@@ -147,7 +139,7 @@ public class PLSLightingPass {
         GL11.glDrawArrays(GL11.GL_TRIANGLES, 0, 3);
         GL30.glBindVertexArray(0);
 
-        // Blit resultado de volta para o FBO do Minecraft
+        // Blit resultado → FBO do Minecraft
         GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, outputFbo);
         GL30.glBindFramebuffer(GL30.GL_DRAW_FRAMEBUFFER, fb.fbo);
         GL30.glBlitFramebuffer(
@@ -159,12 +151,11 @@ public class PLSLightingPass {
         // Restaura estado
         GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, prevFbo);
         GL20.glUseProgram(prevProgram);
-        if (depth)  GL11.glEnable(GL11.GL_DEPTH_TEST);
-        if (blend)  GL11.glEnable(GL11.GL_BLEND);
+        if (depth) GL11.glEnable(GL11.GL_DEPTH_TEST);
+        if (blend) GL11.glEnable(GL11.GL_BLEND);
     }
 
     private static void rebuildOutputFbo(int w, int h) {
-        // Limpa anterior
         if (outputFbo != 0) GL30.glDeleteFramebuffers(outputFbo);
         if (outputTex != 0) GL11.glDeleteTextures(outputTex);
 
@@ -196,10 +187,10 @@ public class PLSLightingPass {
     }
 
     public static void cleanup() {
-        if (program   != 0) { GL20.glDeleteProgram(program);          program   = 0; }
-        if (quadVao   != 0) { GL30.glDeleteVertexArrays(quadVao);     quadVao   = 0; }
-        if (outputFbo != 0) { GL30.glDeleteFramebuffers(outputFbo);   outputFbo = 0; }
-        if (outputTex != 0) { GL11.glDeleteTextures(outputTex);       outputTex = 0; }
+        if (program   != 0) { GL20.glDeleteProgram(program);        program   = 0; }
+        if (quadVao   != 0) { GL30.glDeleteVertexArrays(quadVao);   quadVao   = 0; }
+        if (outputFbo != 0) { GL30.glDeleteFramebuffers(outputFbo); outputFbo = 0; }
+        if (outputTex != 0) { GL11.glDeleteTextures(outputTex);     outputTex = 0; }
         ready = false;
     }
 
