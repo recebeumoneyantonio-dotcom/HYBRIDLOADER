@@ -1,39 +1,48 @@
 package com.maliopt.pipeline;
 
 import com.maliopt.MaliOptMod;
+import com.maliopt.shader.ShaderExecutionLayer;
+import com.maliopt.shader.PerformanceGuard;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gl.Framebuffer;
 import org.lwjgl.opengl.*;
 
 /**
- * PLSLightingPass — Fase 3a
+ * PLSLightingPass — Fase 3a (v1.2)
  *
- * Aplica warmth e AO à cena renderizada.
+ * Warmth suave + AO simulado. Sem tonemapping.
  *
- * ── CORRECÇÕES v1.1 ──────────────────────────────────────────────────
+ * ── CORRECÇÕES v1.2 ──────────────────────────────────────────────
  *
- * Bug corrigido: faltava glBindTexture(0) depois do draw.
- *   O texture binding ficava activo quando o FBFetchBloomPass corria,
- *   o que causava que o blit final do PLSLightingPass usasse dados
- *   incorrectos em alguns drivers Mali.
+ *   uWarmth 0.18 → 0.06  — warmth agressivo causava tint laranja
+ *   uAO 0.12 mantido     — AO subtil está correcto
  *
- * Bug corrigido: gamma estava aplicado aqui E reinhard no FBFetchBloomPass.
- *   Double-tonemapping = imagem escura sem contraste.
- *   CORRECÇÃO: gamma REMOVIDO deste pass. O FBFetchBloomPass é o único
- *   tonemapper do pipeline (reinhard no final, depois do bloom).
+ *   Integração com ShaderExecutionLayer:
+ *     shaders compilados via SEL.compile() recebem #defines Mali
  *
- * ── PIPELINE CORRECTO ────────────────────────────────────────────────
- *   1. PLSLightingPass  → warmth + AO (sem tonemapping)
- *   2. FBFetchBloomPass → bloom + reinhard (único tonemapper)
+ *   Integração com PerformanceGuard:
+ *     warmth e AO ajustados dinamicamente por FPS
+ *     pass desactivado automaticamente em modo DEGRADED
+ *
+ * ── PIPELINE CORRECTO ────────────────────────────────────────────
+ *   1. PLSLightingPass  → warmth (suave) + AO  [sem tonemapping]
+ *   2. FBFetchBloomPass → bloom espacial + reinhard [único tonemapper]
  */
 public class PLSLightingPass {
-    private static int program = 0;
-    private static int quadVao = 0;
-    private static int outputFbo = 0;
-    private static int outputTex = 0;
-    private static int lastW = 0;
-    private static int lastH = 0;
-    private static boolean ready = false;
+
+    private static int     program   = 0;
+    private static int     quadVao   = 0;
+    private static int     outputFbo = 0;
+    private static int     outputTex = 0;
+    private static int     lastW     = 0;
+    private static int     lastH     = 0;
+    private static boolean ready     = false;
+
+    // Uniform locations (cached)
+    private static int uWarmth = -1;
+    private static int uAO     = -1;
+
+    // ── GLSL ─────────────────────────────────────────────────────────
 
     private static final String VERT =
         "#version 310 es\n" +
@@ -44,37 +53,47 @@ public class PLSLightingPass {
         "    gl_Position = vec4(uv * 2.0 - 1.0, 0.0, 1.0);\n" +
         "}\n";
 
-    // ✅ FIX: gamma REMOVIDO — o FBFetchBloomPass aplica reinhard no final.
-    // Ter gamma aqui + reinhard no bloom = double-tonemapping = imagem escura.
-    // Este pass só faz warmth (color grading) e AO simulado.
+    // Warmth subtil + AO. SEM gamma/tonemapping — isso é trabalho do BloomPass.
+    // Os #defines Mali são injectados automaticamente pelo ShaderExecutionLayer.
     private static final String FRAG =
         "#version 310 es\n" +
-        "precision mediump float;\n" +
+        "precision mediump float;\n" +   // mediump suficiente para color grading
         "uniform sampler2D uScene;\n" +
         "uniform float uWarmth;\n" +
         "uniform float uAO;\n" +
         "in vec2 vUv;\n" +
         "out vec4 fragColor;\n" +
+        "\n" +
         "void main() {\n" +
         "    vec4 scene = texture(uScene, vUv);\n" +
-        "    float lum = dot(scene.rgb, vec3(0.299, 0.587, 0.114));\n" +
-        // Warmth: boost ligeiro nos reds/greens, reduz blues nas zonas claras
+        "    float lum  = dot(scene.rgb, vec3(0.299, 0.587, 0.114));\n" +
+        "\n" +
+        "    // Warmth v1.2: escala reduzida para evitar cast laranja\n" +
+        "    // uWarmth=0.06 → boost máximo de +6% no red, -1.5% no blue\n" +
         "    vec3 warm = scene.rgb * vec3(\n" +
         "        1.0 + uWarmth * lum,\n" +
         "        1.0 + uWarmth * 0.45 * lum,\n" +
         "        1.0 - uWarmth * 0.25 * lum\n" +
         "    );\n" +
-        // AO simulado: escurece zonas escuras proporcionalmente
-        "    float ao = mix(1.0 - uAO, 1.0, lum);\n" +
-        // ✅ SEM pow/gamma aqui — resultado linear para o bloom processar
-        "    vec3 result = clamp(warm * ao, 0.0, 1.0);\n" +
+        "\n" +
+        "    // AO simulado: escurece proporcionalmente às zonas escuras\n" +
+        "    float ao     = mix(1.0 - uAO, 1.0, lum);\n" +
+        "    vec3 result  = warm * ao;\n" +
+        "\n" +
+        "    // Sem clamp agressivo: permite valores ligeiramente > 1.0\n" +
+        "    // O reinhard no BloomPass trata os highlights correctamente\n" +
         "    fragColor = vec4(result, scene.a);\n" +
         "}\n";
 
+    // ── INIT ──────────────────────────────────────────────────────────
+
     public static void init() {
         try {
-            int vert = compile(GL20.GL_VERTEX_SHADER, VERT, "LightingPass_vert");
-            int frag = compile(GL20.GL_FRAGMENT_SHADER, FRAG, "LightingPass_frag");
+            // Compila via SEL — injeta #defines Mali automaticamente
+            int vert = ShaderExecutionLayer.compile(
+                GL20.GL_VERTEX_SHADER, VERT, "LightingPass_vert");
+            int frag = ShaderExecutionLayer.compile(
+                GL20.GL_FRAGMENT_SHADER, FRAG, "LightingPass_frag");
             if (vert == 0 || frag == 0) return;
 
             program = GL20.glCreateProgram();
@@ -92,22 +111,28 @@ public class PLSLightingPass {
                 return;
             }
 
+            // Cache de uniform locations
             GL20.glUseProgram(program);
-            GL20.glUniform1i(GL20.glGetUniformLocation(program, "uScene"),   0);
-            GL20.glUniform1f(GL20.glGetUniformLocation(program, "uWarmth"), 0.18f);
-            GL20.glUniform1f(GL20.glGetUniformLocation(program, "uAO"),     0.12f);
+            GL20.glUniform1i(GL20.glGetUniformLocation(program, "uScene"), 0);
+            uWarmth = GL20.glGetUniformLocation(program, "uWarmth");
+            uAO     = GL20.glGetUniformLocation(program, "uAO");
             GL20.glUseProgram(0);
 
             quadVao = GL30.glGenVertexArrays();
-            ready = true;
-            MaliOptMod.LOGGER.info("[MaliOpt] ✅ PLSLightingPass iniciado");
+            ready   = true;
+            MaliOptMod.LOGGER.info("[MaliOpt] ✅ PLSLightingPass v1.2 iniciado");
         } catch (Exception e) {
-            MaliOptMod.LOGGER.error("[MaliOpt] PLSLightingPass.init() erro: {}", e.getMessage());
+            MaliOptMod.LOGGER.error("[MaliOpt] PLSLightingPass.init(): {}", e.getMessage());
         }
     }
 
+    // ── RENDER ───────────────────────────────────────────────────────
+
     public static void render(MinecraftClient mc) {
         if (!ready || program == 0 || mc.world == null) return;
+
+        // PerformanceGuard: desactiva em DEGRADED
+        if (!PerformanceGuard.lightingPassEnabled()) return;
 
         Framebuffer fb = mc.getFramebuffer();
         int w = fb.textureWidth;
@@ -123,38 +148,67 @@ public class PLSLightingPass {
         GL11.glDisable(GL11.GL_DEPTH_TEST);
         GL11.glDisable(GL11.GL_BLEND);
 
-        // Rende warmth+AO em outputFbo, usando fb como textura de input
         GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, outputFbo);
         GL11.glViewport(0, 0, w, h);
         GL20.glUseProgram(program);
+
+        // Uniforms dinâmicos via PerformanceGuard
+        GL20.glUniform1f(uWarmth, PerformanceGuard.warmth());
+        GL20.glUniform1f(uAO,     PerformanceGuard.ambientOcclusion());
+
         GL13.glActiveTexture(GL13.GL_TEXTURE0);
         GL11.glBindTexture(GL11.GL_TEXTURE_2D, fb.getColorAttachment());
         GL30.glBindVertexArray(quadVao);
         GL11.glDrawArrays(GL11.GL_TRIANGLES, 0, 3);
         GL30.glBindVertexArray(0);
+        GL11.glBindTexture(GL11.GL_TEXTURE_2D, 0);  // unbind antes do blit
 
-        // ✅ FIX: unbind da textura ANTES do blit
-        // Sem isto, o texture binding activo pode interferir com o blit
-        // e com o FBFetchBloomPass que corre a seguir.
-        GL11.glBindTexture(GL11.GL_TEXTURE_2D, 0);
-
-        // Blit resultado → framebuffer principal do Minecraft
+        // Blit → framebuffer principal
         GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, outputFbo);
         GL30.glBindFramebuffer(GL30.GL_DRAW_FRAMEBUFFER, fb.fbo);
         GL30.glBlitFramebuffer(0, 0, w, h, 0, 0, w, h,
             GL11.GL_COLOR_BUFFER_BIT, GL11.GL_NEAREST);
 
-        // Restaura estado
         GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, prevFbo);
         GL20.glUseProgram(prevProgram);
         if (depth) GL11.glEnable(GL11.GL_DEPTH_TEST);
         if (blend) GL11.glEnable(GL11.GL_BLEND);
     }
 
+    // ── FBO ──────────────────────────────────────────────────────────
+
     private static void rebuildOutputFbo(int w, int h) {
         if (outputFbo != 0) GL30.glDeleteFramebuffers(outputFbo);
         if (outputTex != 0) GL11.glDeleteTextures(outputTex);
 
+        outputTex = GL11.glGenTextures();
+        GL11.glBindTexture(GL11.GL_TEXTURE_2D, outputTex);
+        GL11.glTexImage2D(GL11.GL_TEXTURE_2D, 0, GL30.GL_RGBA16F,
+            w, h, 0, GL11.GL_RGBA, GL11.GL_FLOAT, 0L);  // FP16 para preservar highlights
+        GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_NEAREST);
+        GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_NEAREST);
+
+        outputFbo = GL30.glGenFramebuffers();
+        GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, outputFbo);
+        GL30.glFramebufferTexture2D(GL30.GL_FRAMEBUFFER,
+            GL30.GL_COLOR_ATTACHMENT0, GL11.GL_TEXTURE_2D, outputTex, 0);
+
+        int status = GL30.glCheckFramebufferStatus(GL30.GL_FRAMEBUFFER);
+        if (status != GL30.GL_FRAMEBUFFER_COMPLETE) {
+            MaliOptMod.LOGGER.error("[MaliOpt] PLS FBO incompleto: 0x{}",
+                Integer.toHexString(status));
+            // Fallback: tenta RGBA8 se RGBA16F não suportado
+            GL30.glDeleteFramebuffers(outputFbo);
+            GL11.glDeleteTextures(outputTex);
+            rebuildOutputFboRGBA8(w, h);
+        } else {
+            lastW = w; lastH = h;
+            MaliOptMod.LOGGER.info("[MaliOpt] PLS FBO RGBA16F: {}x{}", w, h);
+        }
+        GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, 0);
+    }
+
+    private static void rebuildOutputFboRGBA8(int w, int h) {
         outputTex = GL11.glGenTextures();
         GL11.glBindTexture(GL11.GL_TEXTURE_2D, outputTex);
         GL11.glTexImage2D(GL11.GL_TEXTURE_2D, 0, GL11.GL_RGBA8,
@@ -167,41 +221,26 @@ public class PLSLightingPass {
         GL30.glFramebufferTexture2D(GL30.GL_FRAMEBUFFER,
             GL30.GL_COLOR_ATTACHMENT0, GL11.GL_TEXTURE_2D, outputTex, 0);
 
-        int status = GL30.glCheckFramebufferStatus(GL30.GL_FRAMEBUFFER);
-        if (status != GL30.GL_FRAMEBUFFER_COMPLETE) {
-            MaliOptMod.LOGGER.error("[MaliOpt] PLS FBO incompleto: {}", status);
+        if (GL30.glCheckFramebufferStatus(GL30.GL_FRAMEBUFFER) != GL30.GL_FRAMEBUFFER_COMPLETE) {
+            MaliOptMod.LOGGER.error("[MaliOpt] PLS FBO RGBA8 também falhou");
             GL30.glDeleteFramebuffers(outputFbo);
             GL11.glDeleteTextures(outputTex);
-            outputFbo = 0;
-            outputTex = 0;
+            outputFbo = 0; outputTex = 0;
         } else {
-            lastW = w;
-            lastH = h;
-            MaliOptMod.LOGGER.info("[MaliOpt] PLS FBO criado: {}x{}", w, h);
+            lastW = w; lastH = h;
+            MaliOptMod.LOGGER.info("[MaliOpt] PLS FBO RGBA8 (fallback): {}x{}", w, h);
         }
-        GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, 0);
     }
 
+    // ── CLEANUP ──────────────────────────────────────────────────────
+
     public static void cleanup() {
-        if (program   != 0) { GL20.glDeleteProgram(program);         program   = 0; }
-        if (quadVao   != 0) { GL30.glDeleteVertexArrays(quadVao);    quadVao   = 0; }
-        if (outputFbo != 0) { GL30.glDeleteFramebuffers(outputFbo);  outputFbo = 0; }
-        if (outputTex != 0) { GL11.glDeleteTextures(outputTex);      outputTex = 0; }
+        if (program   != 0) { GL20.glDeleteProgram(program);        program   = 0; }
+        if (quadVao   != 0) { GL30.glDeleteVertexArrays(quadVao);   quadVao   = 0; }
+        if (outputFbo != 0) { GL30.glDeleteFramebuffers(outputFbo); outputFbo = 0; }
+        if (outputTex != 0) { GL11.glDeleteTextures(outputTex);     outputTex = 0; }
         ready = false;
     }
 
     public static boolean isReady() { return ready; }
-
-    private static int compile(int type, String src, String name) {
-        int id = GL20.glCreateShader(type);
-        GL20.glShaderSource(id, src);
-        GL20.glCompileShader(id);
-        if (GL20.glGetShaderi(id, GL20.GL_COMPILE_STATUS) == GL11.GL_FALSE) {
-            MaliOptMod.LOGGER.error("[MaliOpt] Shader {} falhou: {}",
-                name, GL20.glGetShaderInfoLog(id));
-            GL20.glDeleteShader(id);
-            return 0;
-        }
-        return id;
-    }
-            }
+                               }
