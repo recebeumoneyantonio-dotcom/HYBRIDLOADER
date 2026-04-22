@@ -35,7 +35,7 @@ dependencies {
     modImplementation "dev.isxander:yet-another-config-lib:3.8.2+1.21.1-fabric"
 
     // Mod Menu (versão correta para 1.21.1)
-    modImplementation "com.terraformersmc:modmenu:11.0.4"
+    modImplementation "maven.modrinth:modmenu:11.0.1"
 
     // Opcionais (descomente se quiser testar com Sodium/Iris)
     // modCompileOnly "maven.modrinth:sodium:mc1.21.1-0.6.0-fabric"
