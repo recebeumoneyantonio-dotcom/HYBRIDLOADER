@@ -36,13 +36,16 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      # 🗑️ ELIMINAR O ACCESS WIDENER CORROMPIDO (SOLUÇÃO FINAL)
+      # 🗑️ ELIMINAR O ACCESS WIDENER ANTES DE QUALQUER COMANDO GRADLE
       - name: Remover access widener inválido
         run: rm -f src/main/resources/maliopt.accesswidener
 
+      # 🔧 Gerar Wrapper (só se não existir) – AGORA DEPOIS DA REMOÇÃO
       - name: Gerar Gradle Wrapper
         run: |
-          gradle wrapper --gradle-version 8.8
+          if [ ! -f "./gradlew" ]; then
+            gradle wrapper --gradle-version 8.8
+          fi
           chmod +x ./gradlew
 
       - name: Limpar cache do Loom
