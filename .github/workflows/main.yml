@@ -5,7 +5,7 @@ on:
     branches: [ main, master, develop ]
   pull_request:
     branches: [ main, master ]
-  workflow_dispatch:      # Permite execução manual
+  workflow_dispatch:
 
 jobs:
   build:
@@ -36,27 +36,30 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      - name: Gerar Gradle Wrapper (se necessário)
+      # ⚠️ PASSO CRÍTICO: Gerar o Gradle Wrapper automaticamente
+      - name: Gerar Gradle Wrapper
         run: |
-          if [ ! -f "./gradlew" ]; then
-            gradle wrapper --gradle-version 8.8
-          fi
+          gradle wrapper --gradle-version 8.8
           chmod +x ./gradlew
 
-      - name: Limpar cache do Loom (evita erros de access widener)
+      # 🧹 Limpar cache do Loom para evitar erro de access widener
+      - name: Limpar cache do Loom
         run: rm -rf .gradle/loom-cache || true
 
+      # 🔨 Compilar o mod
       - name: Compilar com Gradle
         run: ./gradlew clean build --no-daemon
 
-      - name: Publicar artefacto (JAR)
+      # 📦 Publicar artefacto (JAR)
+      - name: Upload do artefacto
         uses: actions/upload-artifact@v4
         with:
           name: maliopt-${{ github.sha }}
           path: build/libs/*.jar
           if-no-files-found: error
 
-      - name: Criar Release (se for tag)
+      # 🚀 Criar Release (apenas para tags)
+      - name: Criar Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
