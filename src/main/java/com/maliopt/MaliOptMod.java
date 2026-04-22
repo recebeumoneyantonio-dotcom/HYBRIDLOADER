@@ -1,6 +1,8 @@
 package com.maliopt;
 
 import com.maliopt.config.MaliOptConfig;
+import com.maliopt.config.MaliOptConfigScreen;
+import com.maliopt.config.MaliOptVisualConfig;
 import com.maliopt.gpu.ExtensionActivator;
 import com.maliopt.gpu.GPUDetector;
 import com.maliopt.gpu.MobileGluesDetector;
@@ -9,10 +11,15 @@ import com.maliopt.performance.PerformanceGuard;
 import com.maliopt.pipeline.FBFetchBloomPass;
 import com.maliopt.pipeline.MaliPipelineOptimizer;
 import com.maliopt.pipeline.PLSLightingPass;
+import com.maliopt.pipeline.ShadowPass;
+import com.maliopt.pipeline.SSRPass;
+import com.maliopt.pipeline.ColoredLightsPass;
 import com.maliopt.pipeline.ShaderCacheManager;
 import com.maliopt.shader.ShaderCache;
 import com.maliopt.shader.ShaderCapabilities;
 import com.maliopt.shader.ShaderExecutionLayer;
+import com.terraformersmc.modmenu.api.ConfigScreenFactory;
+import com.terraformersmc.modmenu.api.ModMenuApi;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents;
@@ -22,7 +29,7 @@ import net.minecraft.client.option.SimpleOption;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public class MaliOptMod implements ClientModInitializer {
+public class MaliOptMod implements ClientModInitializer, ModMenuApi {
 
     public static final String MOD_ID = "maliopt";
     public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
@@ -30,29 +37,32 @@ public class MaliOptMod implements ClientModInitializer {
     private static final int MAX_RENDER_DISTANCE     = 3;
     private static final int MAX_SIMULATION_DISTANCE = 5;
 
-    // ── Estado do plugin nativo ────────────────────────────────────────
     private static boolean nativePluginLoaded = false;
 
-    /** Indica se libmaliopt.so foi carregada com sucesso. */
-    public static boolean isNativePluginLoaded() {
-        return nativePluginLoaded;
+    public static boolean isNativePluginLoaded() { return nativePluginLoaded; }
+
+    // ── ModMenu API ───────────────────────────────────────────────────
+    @Override
+    public ConfigScreenFactory<?> getModConfigScreenFactory() {
+        return MaliOptConfigScreen::create;
     }
 
+    // ── Inicialização ─────────────────────────────────────────────────
     @Override
     public void onInitializeClient() {
-        LOGGER.info("[MaliOpt] Registando eventos...");
-        MaliOptConfig.load();
+        LOGGER.info("[MaliOpt] Iniciando...");
 
-        // Tenta carregar o plugin nativo o mais cedo possível —
-        // antes do CLIENT_STARTED, para que ShaderCapabilities
-        // já saiba qual caminho usar durante o init.
+        // 1. Carregar configs (legacy + nova visual)
+        MaliOptConfig.load();
+        MaliOptVisualConfig.load();
+
+        // 2. Plugin nativo
         nativePluginLoaded = loadNativePlugin();
 
         ClientLifecycleEvents.CLIENT_STARTED.register(client -> {
 
             MobileGluesDetector.detect();
 
-            LOGGER.info("[MaliOpt] Cliente iniciado — verificando GPU...");
             LOGGER.info("[MaliOpt] Renderer : {}", GPUDetector.getRenderer());
             LOGGER.info("[MaliOpt] Vendor   : {}", GPUDetector.getVendor());
             LOGGER.info("[MaliOpt] Version  : {}", GPUDetector.getVersion());
@@ -67,31 +77,27 @@ public class MaliOptMod implements ClientModInitializer {
             if (GPUDetector.isMaliGPU()) {
                 LOGGER.info("[MaliOpt] ✅ GPU Mali detectada — activando optimizações");
 
-                // ── 1. Extensões hardware ────────────────────────────
                 ExtensionActivator.activateAll();
-
-                // ── 2. Capacidades de shader ─────────────────────────
-                // Passa o flag nativo — ShaderCapabilities escolhe
-                // automaticamente o melhor caminho disponível.
                 ShaderCapabilities.init(nativePluginLoaded);
-
-                // ── 3. Camada de execução de shaders ─────────────────
                 ShaderExecutionLayer.init();
 
-                // ── 4. Cache de shaders compilados ───────────────────
                 try {
                     ShaderCache.init(FabricLoader.getInstance().getGameDir());
                 } catch (Exception e) {
                     LOGGER.warn("[MaliOpt] ShaderCache.init falhou: {}", e.getMessage());
                 }
 
-                // ── 5. Pipeline de renderização ───────────────────────
                 MaliPipelineOptimizer.init();
                 ShaderCacheManager.init();
 
-                // ── 6. Passes de post-processing ─────────────────────
+                // Passes existentes
                 PLSLightingPass.init();
                 FBFetchBloomPass.init();
+
+                // Novos passes visuais
+                ShadowPass.init();
+                SSRPass.init();
+                ColoredLightsPass.init();
 
                 forceDistances(client);
 
@@ -100,63 +106,68 @@ public class MaliOptMod implements ClientModInitializer {
             }
         });
 
-        // ── Post-process pipeline ─────────────────────────────────
+        // ── Pipeline de post-process ──────────────────────────────────
         WorldRenderEvents.LAST.register(context -> {
             MinecraftClient mc = MinecraftClient.getInstance();
+            MaliOptVisualConfig cfg = MaliOptVisualConfig.get();
 
-            // 0. Atualiza monitor de performance (uma vez por frame)
             PerformanceGuard.update(mc);
 
-            // 1. PLSLightingPass — warmth, AO, gamma
-            if (PLSLightingPass.isReady() && PerformanceGuard.lightingPassEnabled()) {
+            // Lighting pass — respeita toggle do menu
+            if (PLSLightingPass.isReady()
+                    && cfg.lightingEnabled
+                    && PerformanceGuard.lightingPassEnabled()) {
                 PLSLightingPass.render(mc);
             }
 
-            // 2. FBFetchBloomPass — bloom adaptativo
-            if (FBFetchBloomPass.isReady() && PerformanceGuard.bloomEnabled()) {
+            // Bloom — respeita toggle do menu
+            if (FBFetchBloomPass.isReady()
+                    && cfg.bloomEnabled
+                    && PerformanceGuard.bloomEnabled()) {
                 FBFetchBloomPass.render(mc);
+            }
+
+            // Sombras
+            if (ShadowPass.isReady() && cfg.shadowsEnabled) {
+                ShadowPass.render(mc);
+            }
+
+            // SSR
+            if (SSRPass.isReady() && cfg.ssrEnabled) {
+                SSRPass.render(mc);
+            }
+
+            // Luzes coloridas
+            if (ColoredLightsPass.isReady() && cfg.coloredLightsEnabled) {
+                ColoredLightsPass.render(mc);
             }
         });
 
-        // Cleanup ao fechar
+        // Cleanup
         ClientLifecycleEvents.CLIENT_STOPPING.register(client -> {
             PLSLightingPass.cleanup();
             FBFetchBloomPass.cleanup();
+            ShadowPass.cleanup();
+            SSRPass.cleanup();
+            ColoredLightsPass.cleanup();
         });
     }
 
-    // ════════════════════════════════════════════════════════════════
-    // PLUGIN NATIVO
-    // ════════════════════════════════════════════════════════════════
+    // ── Plugin nativo ─────────────────────────────────────────────────
 
-    /**
-     * Tenta carregar libmaliopt.so do plugin APK.
-     *
-     * O ZalithLauncher inclui automaticamente a biblioteca do plugin
-     * no java.library.path do processo Minecraft.
-     * Se a biblioteca não for encontrada, o mod continua normalmente
-     * usando o caminho OpenGL via ExtensionActivator (fallback seguro).
-     *
-     * @return true se carregou com sucesso, false caso contrário.
-     */
     private static boolean loadNativePlugin() {
         try {
             System.loadLibrary("maliopt");
-            LOGGER.info("[MaliOpt] ✅ Plugin nativo libmaliopt.so carregado — " +
-                        "extensões reais do driver activas");
+            LOGGER.info("[MaliOpt] ✅ libmaliopt.so carregado");
             return true;
         } catch (UnsatisfiedLinkError e) {
-            LOGGER.info("[MaliOpt] Plugin nativo não disponível — " +
-                        "usando detecção OpenGL (fallback seguro)");
+            LOGGER.info("[MaliOpt] Plugin nativo não disponível — fallback OpenGL");
             return false;
         } catch (SecurityException e) {
-            LOGGER.warn("[MaliOpt] Permissão negada ao carregar plugin nativo: {}",
-                        e.getMessage());
+            LOGGER.warn("[MaliOpt] Permissão negada: {}", e.getMessage());
             return false;
         }
     }
-
-    // ════════════════════════════════════════════════════════════════
 
     private static void forceDistances(MinecraftClient client) {
         if (client == null || client.options == null) return;
@@ -168,30 +179,19 @@ public class MaliOptMod implements ClientModInitializer {
             int currentRender = viewDist.getValue();
             if (currentRender > MAX_RENDER_DISTANCE) {
                 viewDist.setValue(MAX_RENDER_DISTANCE);
-                LOGGER.info("[MaliOpt] Render distance: {} → {} ✅",
-                    currentRender, MAX_RENDER_DISTANCE);
+                LOGGER.info("[MaliOpt] Render distance: {} → {} ✅", currentRender, MAX_RENDER_DISTANCE);
                 changed = true;
-            } else {
-                LOGGER.info("[MaliOpt] Render distance: {} (já dentro do limite)",
-                    currentRender);
             }
 
             SimpleOption<Integer> simDist = acc.maliopt_getSimulationDistance();
             int currentSim = simDist.getValue();
             if (currentSim > MAX_SIMULATION_DISTANCE) {
                 simDist.setValue(MAX_SIMULATION_DISTANCE);
-                LOGGER.info("[MaliOpt] Simulation distance: {} → {} ✅",
-                    currentSim, MAX_SIMULATION_DISTANCE);
+                LOGGER.info("[MaliOpt] Simulation distance: {} → {} ✅", currentSim, MAX_SIMULATION_DISTANCE);
                 changed = true;
-            } else {
-                LOGGER.info("[MaliOpt] Simulation distance: {} (já dentro do limite)",
-                    currentSim);
             }
 
-            if (changed) {
-                client.options.write();
-                LOGGER.info("[MaliOpt] Distâncias guardadas em options.txt ✅");
-            }
+            if (changed) client.options.write();
 
         } catch (Exception e) {
             LOGGER.warn("[MaliOpt] forceDistances falhou: {}", e.getMessage());
@@ -202,4 +202,4 @@ public class MaliOptMod implements ClientModInitializer {
         if (v <= 0) return "desconhecida";
         return (v / 1000) + "." + ((v % 1000) / 100) + "." + (v % 100);
     }
-}
+                }
