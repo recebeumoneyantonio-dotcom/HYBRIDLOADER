@@ -8,7 +8,7 @@ import net.minecraft.client.gl.Framebuffer;
 import org.lwjgl.opengl.*;
 
 /**
- * PLSLightingPass — Fase 3a (v2.0)
+ * PLSLightingPass — Fase 3a (v2.1)
  *
  * ── FILOSOFIA ────────────────────────────────────────────────────
  *
@@ -33,7 +33,16 @@ import org.lwjgl.opengl.*;
  *
  * ── INTEGRAÇÃO NO PIPELINE ────────────────────────────────────────
  *   1. PLSLightingPass  → micro-ajustes na base  [SEM tonemapping]
- *   2. FBFetchBloomPass → bloom + glow + reinhard [ÚNICO tonemapper]
+ *   2. FBFetchBloomPass → bloom + glow + ACES    [ÚNICO tonemapper]
+ *
+ * ── CHANGELOG v2.1 ───────────────────────────────────────────────
+ *   FIX: smoothstep(0.2, 0.0, lum) — undefined behavior em GLSL ES
+ *        A especificação GLSL ES 3.1 define o resultado como INDEFINIDO
+ *        quando edge0 >= edge1. Embora funcione na maioria dos drivers
+ *        Mali em prática, é UB técnico que pode quebrar em compilações
+ *        futuras ou com optimizações agressivas do compilador.
+ *        Corrigido para: 1.0 - smoothstep(0.0, 0.2, lum)
+ *        Comportamento idêntico, sem UB.
  *
  * ── SEGURANÇA ────────────────────────────────────────────────────
  *   - Falha silenciosa em qualquer erro de compilação/FBO
@@ -72,10 +81,12 @@ public class PLSLightingPass {
     //   Zonas escuras ficam intactas — sem cast amarelo nas sombras
     //   uWarmth=0.05 → boost máximo de +5% no red em zonas muito brilhantes
     //
-    // AO v2.0:
-    //   Só escurece onde lum < 0.2 (sombras profundas reais)
-    //   Zonas médias e claras: ao=1.0 (sem efeito)
-    //   Evita dessaturação global que o v1.x causava
+    // AO v2.1 (FIX):
+    //   smoothstep(0.2, 0.0, lum) era UB em GLSL ES (edge0 >= edge1).
+    //   Substituído por: 1.0 - smoothstep(0.0, 0.2, lum)
+    //   Comportamento idêntico: aoMask=1 quando lum=0, aoMask=0 quando lum>=0.2.
+    //   Só escurece onde lum < 0.2 (sombras profundas reais).
+    //   Zonas médias e claras: ao=1.0 (sem efeito).
     //
     // MICRO-CONTRASTE:
     //   Leve S-curve local apenas no canal de luminância
@@ -105,8 +116,11 @@ public class PLSLightingPass {
         "    );\n" +
         "\n" +
         "    // ── AO: só em sombras profundas (lum < 0.2) ─────────────\n" +
-        "    // Zonas médias/claras ficam com ao=1.0 (sem efeito)\n" +
-        "    float aoMask = smoothstep(0.2, 0.0, lum);\n" +
+        "    // v2.1 FIX: era smoothstep(0.2, 0.0, lum) — UB em GLSL ES\n" +
+        "    // (edge0 >= edge1 → resultado indefinido per-spec).\n" +
+        "    // Corrigido: 1.0 - smoothstep(0.0, 0.2, lum)\n" +
+        "    // Comportamento idêntico: 0 quando lum>=0.2, 1 quando lum=0.\n" +
+        "    float aoMask = 1.0 - smoothstep(0.0, 0.2, lum);\n" +
         "    float ao     = 1.0 - uAO * aoMask;\n" +
         "    c *= ao;\n" +
         "\n" +
@@ -163,7 +177,7 @@ public class PLSLightingPass {
 
             quadVao = GL30.glGenVertexArrays();
             ready   = true;
-            MaliOptMod.LOGGER.info("[MaliOpt] ✅ PLSLightingPass v2.0 iniciado (vanilla-safe)");
+            MaliOptMod.LOGGER.info("[MaliOpt] ✅ PLSLightingPass v2.1 iniciado (smoothstep UB fix, vanilla-safe)");
 
         } catch (Exception e) {
             MaliOptMod.LOGGER.error("[MaliOpt] PLSLightingPass.init() excepção: {}", e.getMessage());
@@ -281,5 +295,4 @@ public class PLSLightingPass {
     }
 
     public static boolean isReady() { return ready; }
-            }
-        
+}
