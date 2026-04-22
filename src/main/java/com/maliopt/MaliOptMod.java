@@ -30,10 +30,23 @@ public class MaliOptMod implements ClientModInitializer {
     private static final int MAX_RENDER_DISTANCE     = 3;
     private static final int MAX_SIMULATION_DISTANCE = 5;
 
+    // ── Estado do plugin nativo ────────────────────────────────────────
+    private static boolean nativePluginLoaded = false;
+
+    /** Indica se libmaliopt.so foi carregada com sucesso. */
+    public static boolean isNativePluginLoaded() {
+        return nativePluginLoaded;
+    }
+
     @Override
     public void onInitializeClient() {
         LOGGER.info("[MaliOpt] Registando eventos...");
         MaliOptConfig.load();
+
+        // Tenta carregar o plugin nativo o mais cedo possível —
+        // antes do CLIENT_STARTED, para que ShaderCapabilities
+        // já saiba qual caminho usar durante o init.
+        nativePluginLoaded = loadNativePlugin();
 
         ClientLifecycleEvents.CLIENT_STARTED.register(client -> {
 
@@ -58,7 +71,9 @@ public class MaliOptMod implements ClientModInitializer {
                 ExtensionActivator.activateAll();
 
                 // ── 2. Capacidades de shader ─────────────────────────
-                ShaderCapabilities.init();
+                // Passa o flag nativo — ShaderCapabilities escolhe
+                // automaticamente o melhor caminho disponível.
+                ShaderCapabilities.init(nativePluginLoaded);
 
                 // ── 3. Camada de execução de shaders ─────────────────
                 ShaderExecutionLayer.init();
@@ -110,6 +125,39 @@ public class MaliOptMod implements ClientModInitializer {
         });
     }
 
+    // ════════════════════════════════════════════════════════════════
+    // PLUGIN NATIVO
+    // ════════════════════════════════════════════════════════════════
+
+    /**
+     * Tenta carregar libmaliopt.so do plugin APK.
+     *
+     * O ZalithLauncher inclui automaticamente a biblioteca do plugin
+     * no java.library.path do processo Minecraft.
+     * Se a biblioteca não for encontrada, o mod continua normalmente
+     * usando o caminho OpenGL via ExtensionActivator (fallback seguro).
+     *
+     * @return true se carregou com sucesso, false caso contrário.
+     */
+    private static boolean loadNativePlugin() {
+        try {
+            System.loadLibrary("maliopt");
+            LOGGER.info("[MaliOpt] ✅ Plugin nativo libmaliopt.so carregado — " +
+                        "extensões reais do driver activas");
+            return true;
+        } catch (UnsatisfiedLinkError e) {
+            LOGGER.info("[MaliOpt] Plugin nativo não disponível — " +
+                        "usando detecção OpenGL (fallback seguro)");
+            return false;
+        } catch (SecurityException e) {
+            LOGGER.warn("[MaliOpt] Permissão negada ao carregar plugin nativo: {}",
+                        e.getMessage());
+            return false;
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════
+
     private static void forceDistances(MinecraftClient client) {
         if (client == null || client.options == null) return;
         try {
@@ -120,20 +168,24 @@ public class MaliOptMod implements ClientModInitializer {
             int currentRender = viewDist.getValue();
             if (currentRender > MAX_RENDER_DISTANCE) {
                 viewDist.setValue(MAX_RENDER_DISTANCE);
-                LOGGER.info("[MaliOpt] Render distance: {} → {} ✅", currentRender, MAX_RENDER_DISTANCE);
+                LOGGER.info("[MaliOpt] Render distance: {} → {} ✅",
+                    currentRender, MAX_RENDER_DISTANCE);
                 changed = true;
             } else {
-                LOGGER.info("[MaliOpt] Render distance: {} (já dentro do limite)", currentRender);
+                LOGGER.info("[MaliOpt] Render distance: {} (já dentro do limite)",
+                    currentRender);
             }
 
             SimpleOption<Integer> simDist = acc.maliopt_getSimulationDistance();
             int currentSim = simDist.getValue();
             if (currentSim > MAX_SIMULATION_DISTANCE) {
                 simDist.setValue(MAX_SIMULATION_DISTANCE);
-                LOGGER.info("[MaliOpt] Simulation distance: {} → {} ✅", currentSim, MAX_SIMULATION_DISTANCE);
+                LOGGER.info("[MaliOpt] Simulation distance: {} → {} ✅",
+                    currentSim, MAX_SIMULATION_DISTANCE);
                 changed = true;
             } else {
-                LOGGER.info("[MaliOpt] Simulation distance: {} (já dentro do limite)", currentSim);
+                LOGGER.info("[MaliOpt] Simulation distance: {} (já dentro do limite)",
+                    currentSim);
             }
 
             if (changed) {
