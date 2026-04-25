@@ -36,11 +36,16 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      # 🗑️ ELIMINAR O ACCESS WIDENER ANTES DE QUALQUER COMANDO GRADlLE
-      - name: Remover access widener inválido
-        run: rm -f src/main/resources/maliopt.accesswidener
+      # 🧹 Limpeza definitiva: remove QUALQUER access widener e cache do Loom
+      - name: Eliminar access wideners e cache do Loom
+        run: |
+          echo "🔍 Procurando ficheiros .accesswidener..."
+          find . -name "*.accesswidener" -type f -print -delete || true
+          echo "🗑️  Removendo cache do Loom..."
+          rm -rf .gradle/loom-cache || true
+          echo "✅ Limpeza concluída."
 
-      # 🔧 Gerar Wrapper (só se não existir) – AGORA DEPOIS DA REMOÇÃO
+      # 🔧 Gerar Wrapper (se necessário) — AGORA DEPOIS DA LIMPEZA TOTAL
       - name: Gerar Gradle Wrapper
         run: |
           if [ ! -f "./gradlew" ]; then
@@ -48,11 +53,8 @@ jobs:
           fi
           chmod +x ./gradlew
 
-      - name: Limpar cache do Loom
-        run: rm -rf .gradle/loom-cache || true
-
       - name: Compilar com Gradle
-        run: ./gradlew clean build --no-daemon
+        run: ./gradlew clean build --refresh-dependencies --no-daemon
 
       - name: Upload do artefacto
         uses: actions/upload-artifact@v4
