@@ -36,16 +36,19 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      # 🧹 Limpeza definitiva: remove QUALQUER access widener e cache do Loom
-      - name: Eliminar access wideners e cache do Loom
+      # 🔐 SOLUÇÃO DEFINITIVA: apagar todos os access wideners e criar um válido
+      - name: Corrigir access widener
         run: |
-          echo "🔍 Procurando ficheiros .accesswidener..."
-          find . -name "*.accesswidener" -type f -print -delete || true
-          echo "🗑️  Removendo cache do Loom..."
-          rm -rf .gradle/loom-cache || true
-          echo "✅ Limpeza concluída."
+          echo "🧹 Removendo access wideners existentes..."
+          find . -name "*.accesswidener" -type f -delete
+          echo "📝 Criando maliopt.accesswidener válido..."
+          mkdir -p src/main/resources
+          echo "accessWidener v2 named" > src/main/resources/maliopt.accesswidener
+          echo "✅ Access widener corrigido."
 
-      # 🔧 Gerar Wrapper (se necessário) — AGORA DEPOIS DA LIMPEZA TOTAL
+      - name: Limpar cache do Loom
+        run: rm -rf .gradle/loom-cache || true
+
       - name: Gerar Gradle Wrapper
         run: |
           if [ ! -f "./gradlew" ]; then
