@@ -36,7 +36,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      # 🗑️ ELIMINAR O ACCESS WIDENER ANTES DE QUALQUER COMANDO GRADLE
+      # 🗑️ ELIMINAR O ACCESS WIDENER ANTES DE QUALQUER COMANDO GRADlLE
       - name: Remover access widener inválido
         run: rm -f src/main/resources/maliopt.accesswidener
 
